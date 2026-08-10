@@ -1,18 +1,28 @@
 package org.example.userauthservice.services;
 
-
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtParser;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.MacAlgorithm;
+import org.antlr.v4.runtime.misc.Pair;
+import org.example.userauthservice.dtos.EmailDto;
 import org.example.userauthservice.models.Role;
 import org.example.userauthservice.models.Status;
 import org.example.userauthservice.models.User;
+import org.example.userauthservice.models.UserSession;
 import org.example.userauthservice.repos.RoleRepo;
+import org.example.userauthservice.repos.SessionRepo;
 import org.example.userauthservice.repos.UserRepo;
 import org.example.userauthservice.constants.RoleValues;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
 
 @Service
 public class AuthService {
@@ -22,6 +32,18 @@ public class AuthService {
 
     @Autowired
     private RoleRepo roleRepo;
+
+    @Autowired
+    private SessionRepo sessionRepo;
+
+    @Autowired
+    private SecretKey secretKey;
+
+    @Autowired
+    private KafkaTemplate<String,String> kafkaTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     public User signup(String name,String email,String password, String phoneNumber) {
         Optional<User> userOptional = userRepo.findByEmail(email);
@@ -49,10 +71,26 @@ public class AuthService {
         roles.add(role);
         user.setRoles(roles);
 
-        return userRepo.save(user);
+        User savedUser =  userRepo.save(user);
+
+        /////////// Add Message into Kafka  //////////////////
+        String topic = "signup";
+        EmailDto emailDto = new EmailDto();
+        emailDto.setTo(email);
+        emailDto.setFrom("anuragonhiring@gmail.com");
+        emailDto.setSubject("Welcome to Scaler");
+        emailDto.setBody("Have a good learning experience !!");
+        try {
+            String message = objectMapper.writeValueAsString(emailDto);
+            kafkaTemplate.send(topic, message);
+        }catch (JsonProcessingException exception) {
+            throw new RuntimeException("Some problem in serializing");
+        }
+        ////////////////////////////
+        return savedUser;
     }
 
-    public User login(String email,String password) {
+    public Pair<User,String> login(String email, String password) {
         Optional<User> userOptional = userRepo.findByEmail(email);
         if (userOptional.isEmpty()) {
             throw new RuntimeException("Please signup first");
@@ -67,6 +105,78 @@ public class AuthService {
             throw new RuntimeException("Invalid Credentials");
         }
 
-        return user;
+        //JWT Generation logic
+        //Hardcoded payload just for demonstration
+//        String message = "{\n" +
+//                "   \"email\": \"anurag@gmail.com\",\n" +
+//                "   \"roles\": [\n" +
+//                "      \"instructor\",\n" +
+//                "      \"buddy\"\n" +
+//                "   ],\n" +
+//                "   \"expirationDate\": \"2ndApril2026\"\n" +
+//                "}";
+//
+//        byte[] content = message.getBytes(StandardCharsets.UTF_8);
+
+        Map<String,Object> claims = new HashMap<>();
+        claims.put("user_id",user.getId());
+
+        List<String> roleValues = new ArrayList<>();
+        for (Role role : user.getRoles()) {
+            roleValues.add(role.getValue());
+        }
+
+        claims.put("access",roleValues);
+        Long currentTimeInMillis = System.currentTimeMillis();
+        claims.put("iat",currentTimeInMillis); //iat = issued at in ms
+        claims.put("exp",currentTimeInMillis+100000); //exp = expiry in ms
+        claims.put("issued_by","scaler");
+        claims.put("type","auth");
+
+
+        //algorithm and secret key for signature generation
+        //in AuthConfig.java
+
+
+        //Generating token on basis of payload only (which is content byte-array)
+        //String token = Jwts.builder().content(content).compact();
+
+        //Generating token using payload and then signing it with secret key
+        //String token = Jwts.builder().content(content).signWith(secretKey).compact();
+
+        //generating a JWT on basis of actual user claims
+        String token = Jwts.builder().claims(claims).signWith(secretKey).compact();
+
+        //Assuming session will not exist before
+        UserSession userSession = new UserSession();
+        userSession.setStatus(Status.ACTIVE);
+        userSession.setUser(user);
+        userSession.setToken(token);
+        sessionRepo.save(userSession);
+
+        return new Pair<>(user,token);
+    }
+
+    public Boolean validateToken(String token) {
+        Optional<UserSession> optionalUserSession = sessionRepo.findByToken(token);
+        if (optionalUserSession.isEmpty()) {
+            return false;
+        }
+
+        JwtParser jwtParser = Jwts.parser().verifyWith(secretKey).build();
+
+        Claims claims = jwtParser.parseSignedClaims(token).getPayload();
+        Long expiry = (Long)claims.get("exp");
+
+        Long currentTime = System.currentTimeMillis();
+        System.out.println("expiry = "+expiry);
+        System.out.println("currentTime = "+currentTime);
+        if(currentTime > expiry) {
+            System.out.println("Token has expired");
+            sessionRepo.delete(optionalUserSession.get());
+            return false;
+        }
+
+        return true;
     }
 }
